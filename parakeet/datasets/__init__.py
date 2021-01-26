@@ -14,3 +14,5 @@
 
 from parakeet.datasets.common import *
 from parakeet.datasets.ljspeech import *
+from parakeet.datasets.libritts import *
+from parakeet.datasets.baker import *
