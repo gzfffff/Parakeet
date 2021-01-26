@@ -13,217 +13,229 @@
 # limitations under the License.
 
 import os
-import tqdm
-import csv
-import argparse
-import numpy as np
-import librosa
 from pathlib import Path
-import pandas as pd
-
-from paddle.io import Dataset
-from parakeet.data import batch_spec, batch_wav
-from parakeet.datasets import LibriTTSMetaData
-from parakeet.audio import AudioProcessor, LogMagnitude
-
-# TODO 这个import好像路径有问题
-# from examples.waveflow.config import get_cfg_defaults
-from config import get_cfg_defaults
-from parakeet.datasets import BakerMetaData
+import pickle
+import numpy as np
+import pandas
+import paddle
+import random
+from paddle.io import Dataset, DataLoader
+from parakeet.data.batch import batch_spec, batch_wav
 
 
-class Transform(object):
-    def __init__(self, sample_rate, n_fft, win_length, hop_length, n_mels):
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.win_length = win_length
+# from parakeet.data.batch import batch_spec, batch_wav
+# from parakeet.data import dataset
+# from parakeet.audio import AudioProcessor
+
+class LibriTTS(Dataset):
+    def __init__(self, root):
+        self.root = Path(root).expanduser()
+        meta_data = pandas.read_csv(
+            # TODO
+            str(self.root / "mixture_100_360.csv"),
+            sep="\t",
+            header=None,
+            names=['fname', 'speaker_id', 'chapter_id', 'text', 'frames', 'samples'])
+        speaker_ids = list({item.speaker_id for item in meta_data.itertuples()})
+
+        speaker_utterances = {}
+        for row in meta_data.itertuples():
+            # print(row)
+            # 长度小于等于65帧则直接忽略
+            if row.frames <= 65:
+                continue
+            speaker_id = row.speaker_id
+            if speaker_id not in speaker_utterances:
+                # speaker_utterances.update({speaker_id: []})
+                speaker_utterances[speaker_id] = []
+            mel_path = str(self.root / "mel" / (row.fname + ".npy"))
+            wav_path = str(self.root / "wav" / (row.fname + ".npy"))
+            speaker_utterances[speaker_id].append([mel_path, wav_path])
+        self.speaker_ids = speaker_ids
+        self.speaker_utterances = speaker_utterances
+        # print("finish loading metadata.csv!")
+
+    def __getitem__(self, utterence):
+        mel_path, wav_path = utterence
+        mel = np.load(mel_path)
+        wav = np.load(wav_path)
+        # print("mel_path: {}, wav_path: {}".format(mel_path, wav_path))
+        # print('mel: {}, wav: {}'.format(mel.shape, wav.shape))
+        return mel, wav
+        # return mel_path, wav_path
+        # return np.random.rand(80, 130), np.random.rand(33280)
+
+    def __len__(self):
+        return sum([len(utterances) for utterances in self.speaker_utterances.values()])
+
+
+class LibriTTSVal(Dataset):
+    """A simple dataset adaptor for the processed ljspeech dataset."""
+
+    def __init__(self, root):
+        self.root = Path(root).expanduser()
+        meta_data = pandas.read_csv(
+            str(self.root / "validation.csv"),
+            sep="\t",
+            header=None,
+            names=['speaker', 'fname'])
+
+        records = []
+        for row in meta_data.itertuples():
+            mel_path = str(self.root / "mel" / (row.fname + ".npy"))
+            wav_path = str(self.root / "wav" / (row.fname + ".npy"))
+            records.append((mel_path, wav_path))
+        self.records = records
+
+    def __getitem__(self, i):
+        mel_name, wav_name = self.records[i]
+        mel = np.load(mel_name)
+        wav = np.load(wav_name)
+        return mel, wav
+
+    def __len__(self):
+        return len(self.records)
+
+
+
+class SpeakerSampler(paddle.io.BatchSampler):
+    def __init__(self, dataset: LibriTTS, batch_size):
+        self._speakers = dataset.speaker_ids
+        self._speaker_utterances = dataset.speaker_utterances
+
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        speaker_generator = iter(random_cycle(self._speakers))
+        speaker_utterances_generator = {s: iter(random_cycle(us)) for s, us in self._speaker_utterances.items()}
+
+        # utterances = []
+        while True:
+            speaker = next(speaker_generator)
+
+            utterances = []
+            for _ in range(self.batch_size):
+                utterances.append(next(speaker_utterances_generator[speaker]))
+            # print(utterances)
+            yield utterances
+
+
+def random_cycle(iterable):
+    # cycle('ABCD') --> A B C D B C D A A D B C ...
+    saved = []
+    for element in iterable:
+        yield element
+        saved.append(element)
+    random.shuffle(saved)
+    while saved:
+        for element in saved:
+              yield element
+        random.shuffle(saved)
+
+
+class TestSampler(paddle.io.BatchSampler):
+    def __init__(self, dataset: LibriTTS, batch_size):
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        while True:
+            batch = [[i, i + 1] for i in range(self.batch_size)]
+            print(batch)
+            yield batch
+
+
+class LibriTTSClipCollector(object):
+    def __init__(self, clip_frames=65, hop_length=256):
+        self.clip_frames = clip_frames
         self.hop_length = hop_length
-        self.n_mels = n_mels
 
-        # 幅度谱取对数
-        self.spec_normalizer = LogMagnitude(min=1e-5)
-        '''
-            sample_rate=22050,  # Hz, sample rate
-            n_fft=1024,  # fft frame size
-            win_length=1024,  # window size
-            hop_length=256,  # hop size between ajacent frame
-            f_max=8000,  # Hz, max frequency when converting to mel
-            n_mels=80,  # mel bands
-            clip_frames=65,  # mel clip frames
-        '''
+    def __call__(self, examples):
+        mels = []
+        wavs = []
+        for example in examples:
+            mel_clip, wav_clip = self.clip(example)
+            mels.append(mel_clip)
+            wavs.append(wav_clip)
+        mels = np.stack(mels)
+        wavs = np.stack(wavs)
+        return mels, wavs
 
-    def __call__(self, example):
-        wav_path, _, _ = example
-
-        sr = self.sample_rate
-        n_fft = self.n_fft
-        win_length = self.win_length
-        hop_length = self.hop_length
-        n_mels = self.n_mels
-
-        wav, loaded_sr = librosa.load(wav_path, sr=sr)
-        # wav, loaded_sr = librosa.load(wav_path, sr=None)
-        assert loaded_sr == sr, "sample rate does not match, resampling applied"
-
-        # np.ceil 向上取整 np.floor向下取整
-        # Pad audio to the right size.
-        frames = int(np.ceil(float(wav.size) / hop_length))
-        # (1024 - 256) // 2
-        fft_padding = (n_fft - hop_length) // 2  # sound
-        desired_length = frames * hop_length + fft_padding * 2
-        pad_amount = (desired_length - wav.size) // 2
-
-        if wav.size % 2 == 0:
-            wav = np.pad(wav, (pad_amount, pad_amount), mode='reflect')
-        else:
-            wav = np.pad(wav, (pad_amount, pad_amount + 1), mode='reflect')
-
-        # Normalize audio.
-        wav = wav / np.abs(wav).max() * 0.999
-
-        # Compute mel-spectrogram.
-        # Turn center to False to prevent internal padding.
-        spectrogram = librosa.core.stft(
-            wav,
-            hop_length=hop_length,
-            win_length=win_length,
-            n_fft=n_fft,
-            center=False)
-        spectrogram_magnitude = np.abs(spectrogram)
-
-        # Compute mel-spectrograms.
-        mel_filter_bank = librosa.filters.mel(sr=sr,
-                                              n_fft=n_fft,
-                                              n_mels=n_mels)
-        mel_spectrogram = np.dot(mel_filter_bank, spectrogram_magnitude)
-        mel_spectrogram = mel_spectrogram
-
-        # log scale mel_spectrogram.
-        mel_spectrogram = self.spec_normalizer.transform(mel_spectrogram)
-
-        # Extract the center of audio that corresponds to mel spectrograms.
-        audio = wav[fft_padding:-fft_padding]
-        assert mel_spectrogram.shape[1] * hop_length == audio.size
-
-        # there is no clipping here
-        return audio, mel_spectrogram
+    def clip(self, example):
+        try:
+            mel, wav = example
+            frames = mel.shape[-1]
+            start = np.random.randint(0, frames - self.clip_frames)
+            mel_clip = mel[:, start:start + self.clip_frames]
+            wav_clip = wav[start * self.hop_length:(start + self.clip_frames) * self.hop_length]
+        except Exception as e:
+            print('-----'*10 + 'LibriTTSClipCollector raises a exception' + '-----'*10)
+            print(repr(e))
+        return mel_clip, wav_clip
 
 
-def create_dataset(config, input_dir, output_dir, verbose=True):
-    input_dir = Path(input_dir).expanduser()
+class LibriTTSCollector(object):
+    """A simple callable to batch LJSpeech examples."""
+
+    def __init__(self, padding_value=0.):
+        self.padding_value = padding_value
+
+    def __call__(self, examples):
+        mels = [example[0] for example in examples]
+        wavs = [example[1] for example in examples]
+        mels = batch_spec(mels, pad_value=self.padding_value)
+        wavs = batch_wav(wavs, pad_value=self.padding_value)
+        return mels, wavs
+
+
+
+if __name__ == '__main__':
+    from paddle.io import DataLoader
+    # from ljspeech import LJSpeech, LJSpeechClipCollector, LJSpeechCollector
+
+    # batch_fn = LJSpeechClipCollector(65, 256)
+    root = "/extra_mnt/audio_datasets/libritts/libritts/LibriTTS/libritts_waveflow/train-clean-100/"
+    val_root = "/extra_mnt/audio_datasets/libritts/libritts/LibriTTS/libritts_waveflow/train-clean-100/"
+    batch_size = 6
+    libritts_dataset = LibriTTS(root)
+    libritts_sampler = SpeakerSampler(libritts_dataset, batch_size)
+    test_sampler = TestSampler(libritts_dataset, batch_size)
+    collate_fn =  LibriTTSClipCollector()
+
+    print(libritts_dataset.speaker_utterances.keys())
+
+    # iterator = iter(libritts_sampler)
+    # for i, item in enumerate(iterator):
+    #     if i > 1000:
+    #         break
+    #     if i % 100 == 0:
+    #         print(item)
+
+
+    print('-----'*10)
     '''
-        LJSpeechMetaData.records包含filename, normalized text, speaker name(ljspeech)
+    print(len(libritts_dataset))
+    dataloader = DataLoader(libritts_dataset, batch_sampler=libritts_sampler, num_workers=0, collate_fn=collate_fn)
+    for i, batch in enumerate(dataloader):
+        if i % 1000 == 0:
+            print("batch: {}, {}".format(batch[0].shape, batch[1].shape))
+        # print("batch: {}, {}".format(batch[0].shape, batch[1].shape))
+        # i = 0
     '''
-    dataset = BakerMetaData(str(input_dir))
-
-    print("libritts dataset size: {}".format(len(dataset)))
-
-    """
-    # TODO 测试代码
-
-    # for i, example in enumerate(dataset):
-    i = 0
-    for example in dataset:
-        if i > 20:
-            break
-        print(example)
-        i += 1
-
-    return
-   """
-
-    # Path(output_dir).expanduser() expanduser()将路径的～替换为绝对路径
-    output_dir = Path(output_dir).expanduser()
-    output_dir.mkdir(exist_ok=True)
-
-    transform = Transform(config.sample_rate, config.n_fft, config.win_length,
-                          config.hop_length, config.n_mels)
-    file_names = []
-    # file_names.append(['index', 'filename', 'speaker_id', 'chapter_id', 'text'])
-
-    # example: ["index", "file_path", "speaker_id", "chapter_id", "text"]
-    print('-----' * 10 + 'begin to preprocess baker dataset' + '-----' * 10)
-    for example in tqdm.tqdm(dataset):
-        file_path, text, pinyin = example
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        wav_dir = output_dir / "wav"
-        mel_dir = output_dir / "mel"
-        wav_dir.mkdir(exist_ok=True)
-        mel_dir.mkdir(exist_ok=True)
-        # audio, mel = transform(example)
-        audio, mel = transform([file_path, None, None])
-        if mel.shape[-1] < 65:
-            continue
-        np.save(str(wav_dir / base_name), audio)
-        np.save(str(mel_dir / base_name), mel)
-        file_names.append([base_name, text, pinyin, mel.shape[-1], audio.shape[-1]])
-
-    meta_data = pd.DataFrame.from_records(file_names)
-    meta_data.to_csv(
-        str(output_dir / "metadata.csv"), sep="\t", index=None, header=None)
-    print("saved meta data in to {}".format(
-        os.path.join(output_dir, "metadata.csv")))
-
-    print("Done!")
-
-    """
-    transform = Transform(config.sample_rate, config.n_fft, config.win_length,
-                          config.hop_length, config.n_mels)
-    file_names = []
-
-    for example in tqdm.tqdm(dataset):
-        fname, _, _ = example
-        # os.path.basename()获得文件路径中的文件名，os.path.splitext()将文件名和后缀分开
-        '''
-            >>> os.path.basename("/home/ljspeech.wav")
-            'ljspeech.wav'
-            >>> os.path.splitext(os.path.basename("/home/ljspeech.wav"))
-            ('ljspeech', '.wav')
-            "/home/ljspeech.wav" -> "ljspeech"
-        '''
-        base_name = os.path.splitext(os.path.basename(fname))[0]
-        wav_dir = output_dir / "wav"
-        mel_dir = output_dir / "mel"
-        wav_dir.mkdir(exist_ok=True)
-        mel_dir.mkdir(exist_ok=True)
-
-        audio, mel = transform(example)
-        np.save(str(wav_dir / base_name), audio)
-        np.save(str(mel_dir / base_name), mel)
-
-        file_names.append((base_name, mel.shape[-1], audio.shape[-1]))
-    """
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="create dataset")
-    parser.add_argument(
-        "--config",
-        type=str,
-        metavar="FILE",
-        help="extra config to overwrite the default config")
-    parser.add_argument(
-        "--input", type=str, help="path of the ljspeech dataset")
-    parser.add_argument(
-        "--output", type=str, help="path to save output dataset")
-    parser.add_argument(
-        "--opts",
-        nargs=argparse.REMAINDER,
-        help="options to overwrite --config file and the default config, passing in KEY VALUE pairs"
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="print msg")
+    # validation dataset test
+    val_libritts_dataset = LibriTTSVal(val_root)
+    val_collate_fn = LibriTTSCollector()
+    val_dataloader = DataLoader(val_libritts_dataset, 
+                                batch_size=1,
+                                shuffle=True,
+                                drop_last=True,
+                                collate_fn=val_collate_fn)
+    for i, batch in enumerate(val_dataloader):
+        if i % 20 == 0:
+            print("batch: {}, {}".format(batch[0].shape, batch[1].shape))
 
-    config = get_cfg_defaults()
-    args = parser.parse_args()
-    if args.config:
-        config.merge_from_file(args.config)
-    if args.opts:
-        config.merge_from_list(args.opts)
-    config.freeze()
-    if args.verbose:
-        print(config.data)
-        print(args)
 
-    create_dataset(config.data, args.input, args.output, args.verbose)
+
+
 

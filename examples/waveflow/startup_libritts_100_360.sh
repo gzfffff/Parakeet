@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES='7' nohup python -u train_libritts.py --data /extra_mnt/audio_datasets/libritts/libritts/LibriTTS/libritts_waveflow/train-clean-360  --output ./outdir/libritts_100_360  --device="gpu" --nprocs=1 >> ./outdir/libritts 2>&1 & 

@@ -17,7 +17,7 @@ from yacs.config import CfgNode as CN
 _C = CN()
 _C.data = CN(
     dict(
-        batch_size=8,  # batch size
+        batch_size=6,  # batch size
         valid_size=16,  # the first N examples are reserved for validation
         sample_rate=22050,  # Hz, sample rate
         n_fft=1024,  # fft frame size
